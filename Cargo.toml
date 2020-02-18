@@ -1,0 +1,21 @@
+[package]
+name = "wrapi"
+
+version = "0.1.0"
+authors = ["Dave Fogelson <dfogelson@fishheadlabs.com>"]
+edition = "2018"
+include = ["Cargo.toml", "src/*.rs", "crates-io.md", "README.md", "LICENSE-MIT"]
+description = "An easy to use API wrapper built with hyper"
+
+[dependencies]
+yup-oauth2 = {path="../../yup-oauth2"}
+hyper = "0.12.14"
+hyper-rustls = "0.16.1"
+futures = "0.3.1"
+log="0.4.8"
+tokio = "0.1.22"
+url= "2.1.1"
+serde = "1.0.104"
+serde_derive = "1.0.104"
+serde_json = "1.0.48"
+serde_with = "1.4.0"
