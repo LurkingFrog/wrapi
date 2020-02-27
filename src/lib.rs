@@ -10,7 +10,38 @@ use hyper::rt::{Future, Stream};
 
 use serde_derive::{Deserialize, Serialize};
 use tokio;
-use yup_oauth2;
+pub use yup_oauth2::GetToken;
+
+/// yup_oauth2::GetToken cannot be objectified, so I'm customizing to make sense for Wrapi consumers
+/// If this is annoying enough, I'm going to write a simplified Oauth client for service accounts so
+/// I can manage multiple users/tokens inside an object
+pub trait Authenticator: yup_oauth2::GetToken {}
+
+impl<T: yup_oauth2::GetToken> Authenticator for T {}
+
+/// Hide as much of the "A" as I can, given it cannot be turned into an object
+/// I may try to re-implement an OAuth2 class inside of Wrapi late, as this gets kind
+/// of messy for highly vertical software like the Process Foundry
+pub enum AuthWrapper<A>
+where
+  A: Authenticator,
+{
+  None,
+  ServiceAccount(RefCell<A>),
+  Password(String, String),
+}
+
+#[derive(Clone, Debug)]
+pub struct ServiceAccountConfig {
+  path: String,
+  as_user: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum AuthMethod {
+  None,
+  ServiceAccount(ServiceAccountConfig),
+}
 
 // TODO: This should be implemented for the API so we can make it  generic
 pub trait WrapiApi {
@@ -31,8 +62,6 @@ pub trait WrapiResult: Send + Sync {
   // fn call<A, T: WrapiResult>(api: API<A>) -> Result<T, WrapiError>;
   fn parse(headers: Vec<(String, String)>, body: Vec<u8>) -> Result<Box<Self>, WrapiError>;
 }
-
-pub trait GetToken: yup_oauth2::GetToken {}
 
 #[derive(Debug)]
 pub enum WrapiError {
@@ -93,12 +122,6 @@ impl MimeType {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum AuthMethod {
-  None,
-  ServiceAccount,
-}
-
-#[derive(Clone, Copy, Debug)]
 pub enum RequestMethod {
   GET,
   POST,
@@ -154,14 +177,17 @@ impl fmt::Debug for Endpoint {
 }
 
 // #[derive(Debug)]
-pub struct API<A> {
+pub struct API {
   client: Box<hyper::Client<hyper_rustls::HttpsConnector<hyper::client::connect::HttpConnector>>>,
-  service_account: Option<RefCell<A>>,
+  // Because of yup_oauth2's use of generics in GetToken, it cannot be persisted without using a Type
+  // Parameter which will need to be known by every module that uses this. Until I fix that, either by
+  // new method or rewrite of the oauth protocol
+  authenticator: AuthMethod,
   endpoints: HashMap<String, Endpoint>,
   runtime: RefCell<tokio::runtime::Runtime>,
 }
 
-impl<A> fmt::Debug for API<A> {
+impl fmt::Debug for API {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(
       f,
@@ -171,25 +197,19 @@ impl<A> fmt::Debug for API<A> {
   }
 }
 
-impl<A> API<A>
-where
-  A: yup_oauth2::GetToken,
-{
-  pub fn new(auth: Option<A>) -> API<A> {
+impl API {
+  pub fn new(auth: AuthMethod) -> API {
     let https_conn = hyper_rustls::HttpsConnector::new(4);
     let client: hyper::client::Client<_, hyper::Body> = hyper::Client::builder().build(https_conn);
     API {
       client: Box::new(client),
-      service_account: match auth {
-        None => None,
-        Some(value) => Some(RefCell::new(value)),
-      },
+      authenticator: auth,
       endpoints: HashMap::new(),
       runtime: RefCell::new(tokio::runtime::Runtime::new().unwrap()),
     }
   }
 
-  pub fn add_endpoint(mut self, name: String, endpoint: Endpoint) -> API<A> {
+  pub fn add_endpoint(mut self, name: String, endpoint: Endpoint) -> API {
     self.endpoints.insert(name, endpoint);
     self
   }
@@ -207,34 +227,40 @@ where
 
   pub fn add_token(
     &self,
-    auth_method: AuthMethod,
+    auth_method: &AuthMethod,
     scopes: Vec<&str>,
     mut req: hyper::Request<hyper::Body>,
   ) -> Result<hyper::Request<hyper::Body>, WrapiError> {
     match auth_method {
       // The service account needs to be added at https://admin.google.com/AdminHome?chromeless=1#OGX:ManageOauthClients
       AuthMethod::None => Ok(req),
-      AuthMethod::ServiceAccount => match &self.service_account {
-        None => Ok(req),
-        Some(sa) => {
-          let fut = sa.borrow_mut().token(scopes);
-          // .map_err(|e| println!("error: {:?}", e))
-          // .and_then(|t| Ok(t));
+      // TODO: This should be caching, but type leakage from yup_oauth2 means it currently cannot reasonably
+      // be done at this level of code
+      AuthMethod::ServiceAccount(conf) => {
+        let creds =
+          yup_oauth2::service_account_key_from_file(path::Path::new(&conf.path[..])).unwrap();
+        let sa = yup_oauth2::ServiceAccountAccess::new(creds);
+        let mut auth = match conf.as_user.clone() {
+          Some(user) => sa.sub(user.to_string()).build(),
+          None => sa.build(),
+        };
+        let fut = auth.token(scopes);
+        // .map_err(|e| println!("error: {:?}", e))
+        // .and_then(|t| Ok(t));
 
-          let token = self
-            .runtime
-            .borrow_mut()
-            .block_on(fut)
-            .expect("Blocked trying to run rt");
+        let token = self
+          .runtime
+          .borrow_mut()
+          .block_on(fut)
+          .expect("Blocked trying to run rt");
 
-          req.headers_mut().insert(
-            hyper::header::HeaderName::from_lowercase(b"authorization").unwrap(),
-            hyper::header::HeaderValue::from_str(&format!("Bearer {}", token.access_token)[..])
-              .unwrap(),
-          );
-          Ok(req)
-        }
-      },
+        req.headers_mut().insert(
+          hyper::header::HeaderName::from_lowercase(b"authorization").unwrap(),
+          hyper::header::HeaderValue::from_str(&format!("Bearer {}", token.access_token)[..])
+            .unwrap(),
+        );
+        Ok(req)
+      }
     }
   }
 
@@ -251,10 +277,7 @@ where
   }
 }
 
-impl<A> WrapiApi for API<A>
-where
-  A: yup_oauth2::GetToken,
-{
+impl WrapiApi for API {
   fn call<'a, B, C>(&self, name: &str, request: B) -> Result<Box<C>, WrapiError>
   where
     B: WrapiRequest,
@@ -264,7 +287,7 @@ where
 
     let req = self.build_request(name, request)?;
     // Add a token, if needed
-    let req = self.add_token(endpoint.auth_method, endpoint.get_scopes(), req)?;
+    let req = self.add_token(&endpoint.auth_method, endpoint.get_scopes(), req)?;
     println!("{:#?}", req);
 
     // Run the request
@@ -289,11 +312,13 @@ where
   }
 }
 
-pub fn build_service_account(path: &str, as_user: Option<&str>) -> impl yup_oauth2::GetToken {
-  let creds = yup_oauth2::service_account_key_from_file(path::Path::new(path)).unwrap();
-  let sa = yup_oauth2::ServiceAccountAccess::new(creds);
-  match as_user {
-    Some(user) => sa.sub(user.to_string()).build(),
-    None => sa.build(),
-  }
+pub fn build_service_account(path: String, as_user: Option<String>) -> AuthMethod {
+  // let creds = yup_oauth2::service_account_key_from_file(path::Path::new(path)).unwrap();
+  // let sa = yup_oauth2::ServiceAccountAccess::new(creds);
+  // let auth = match as_user {
+  //   Some(user) => sa.sub(user.to_string()).build(),
+  //   None => sa.build(),
+  // };
+  // AuthWrapper::YupOauth2(RefCell::new(auth))
+  AuthMethod::ServiceAccount(ServiceAccountConfig { path, as_user })
 }
