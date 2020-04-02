@@ -105,6 +105,12 @@ impl From<std::string::FromUtf8Error> for WrapiError {
   }
 }
 
+impl From<std::io::Error> for WrapiError {
+  fn from(err: std::io::Error) -> WrapiError {
+    WrapiError::General(format!("{:#?}", err))
+  }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum MimeType {
   Null,
@@ -237,8 +243,18 @@ impl API {
       // TODO: This should be caching, but type leakage from yup_oauth2 means it currently cannot reasonably
       // be done at this level of code
       AuthMethod::ServiceAccount(conf) => {
-        let creds =
-          yup_oauth2::service_account_key_from_file(path::Path::new(&conf.path[..])).unwrap();
+        let creds = match yup_oauth2::service_account_key_from_file(path::Path::new(&conf.path[..]))
+        {
+          Ok(x) => x,
+          Err(err) => {
+            let msg = format!(
+              "Could not open service account file at '{:#?}:\n{:#?}'",
+              conf.path, err
+            );
+            log::error!("Could not open service account file at '{:#?}'", conf.path);
+            Err(err)?
+          }
+        };
         let sa = yup_oauth2::ServiceAccountAccess::new(creds);
         let mut auth = match conf.as_user.clone() {
           Some(user) => sa.sub(user.to_string()).build(),
