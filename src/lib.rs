@@ -135,6 +135,17 @@ pub enum RequestMethod {
   UPDATE,
 }
 
+impl RequestMethod {
+  fn to_hyper_method(&self) -> hyper::http::Method {
+    match self {
+      RequestMethod::GET => hyper::http::Method::GET,
+      RequestMethod::POST => hyper::http::Method::POST,
+      RequestMethod::DELETE => hyper::http::Method::DELETE,
+      RequestMethod::UPDATE => hyper::http::Method::PUT,
+    }
+  }
+}
+
 /// A specific function to be called within an external api.
 pub struct Endpoint {
   pub base_url: &'static str,
@@ -153,6 +164,7 @@ impl Endpoint {
     let mut req = hyper::Request::new(hyper::Body::empty());
     *req.uri_mut() = request.build_uri(self.base_url)?.parse().unwrap();
     *req.body_mut() = hyper::Body::from(request.build_body()?);
+    *req.method_mut() = self.request_method.to_hyper_method();
 
     for h in request.build_headers()?.into_iter() {
       let name: hyper::header::HeaderName = h.0.parse().unwrap();
